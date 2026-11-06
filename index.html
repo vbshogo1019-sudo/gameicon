@@ -1663,15 +1663,50 @@
       }
 
       /* ==============================================================
-       * 4. STATE STORAGE & VERSION MANAGEMENT SYSTEM
+       * 4. STATE STORAGE & BULLETPROOF PERSISTENCE SYSTEM
        * ============================================================== */
       const APP_VERSION = '1.2.0';
       const APP_SAVE_FORMAT_VERSION = 5;
       const APP_BUILD_DATE = '2026.11.05';
       const SAVE_STORAGE_KEY = 'daily_challenger_save_data';
-      const LEGACY_STORAGE_KEYS = ['questlife_rpg_save_v4', 'questlife_rpg_save_v3', 'questlife_rpg_save'];
+      const BACKUP_STORAGE_KEY = 'daily_challenger_save_backup';
+      const LEGACY_STORAGE_KEYS = [
+        'questlife_rpg_save_v4',
+        'questlife_rpg_save_v3',
+        'questlife_rpg_save',
+        'daily_challenger_save_backup'
+      ];
+      const ALL_CANDIDATE_KEYS = [
+        SAVE_STORAGE_KEY,
+        'questlife_rpg_save_v4',
+        'questlife_rpg_save_v3',
+        'questlife_rpg_save',
+        BACKUP_STORAGE_KEY
+      ];
       const DC_LAST_TIMESTAMP_KEY = 'dc_last_timestamp';
       const DC_LAST_ACTIVE_KEY = 'dc_last_active_time';
+
+      // Gatekeeper flag: prevents race-condition overwriting with blank state during initial DOM boot
+      let isGameReadyToSave = false;
+
+      // Robust date parser for logs supporting timestamps, numeric strings, and ISO dates
+      function parseLogDate(val) {
+        if (!val) return null;
+        let d;
+        if (typeof val === 'number') {
+          d = new Date(val);
+        } else if (typeof val === 'string') {
+          const trimmed = val.trim();
+          if (/^\d+$/.test(trimmed)) {
+            d = new Date(Number(trimmed));
+          } else {
+            d = new Date(trimmed);
+          }
+        } else if (val instanceof Date) {
+          d = val;
+        }
+        return (d && !isNaN(d.getTime())) ? d : null;
+      }
 
       function recordActiveTimestamp() {
         const now = Date.now();
@@ -1682,93 +1717,244 @@
         } catch(e) {}
       }
 
-      // Check if saved data exists in localStorage
+      // Check if saved data exists in any candidate key in localStorage
       function hasExistingSaveData() {
         try {
-          if (localStorage.getItem(SAVE_STORAGE_KEY)) return true;
-          for (const k of LEGACY_STORAGE_KEYS) {
-            if (localStorage.getItem(k)) return true;
+          for (const k of ALL_CANDIDATE_KEYS) {
+            const raw = localStorage.getItem(k);
+            if (raw && raw.trim().length > 10) return true;
           }
         } catch(e) {}
         return false;
       }
 
+      // Score candidates to prioritize the one with genuine player progression
+      function evaluateSaveCandidateScore(data) {
+        if (!data || typeof data !== 'object') return -1;
+        const c = data.character || {};
+        const lvl = Math.max(1, Number(c.level ?? data.level ?? 1));
+        const coins = Math.max(0, Number(c.coins ?? data.coins ?? 0));
+        const str = Math.max(0, Number(c.str ?? data.str ?? 0));
+        const intVal = Math.max(0, Number(c.int ?? data.int ?? 0));
+        const dex = Math.max(0, Number(c.dex ?? data.dex ?? 0));
+        const totalStats = str + intVal + dex;
+        const exp = Math.max(0, Number(c.exp ?? data.exp ?? 0));
+        const invLen = Array.isArray(data.inventory) ? data.inventory.length : 0;
+        const logLen = Array.isArray(data.achievementLogs) ? data.achievementLogs.length : 0;
+        const stage = Math.max(1, Number(data.battle?.stage ?? data.stage ?? 1));
+        const kills = Math.max(0, Number(data.battle?.killCount ?? data.killCount ?? 0));
+        const customTasksLen = Array.isArray(data.customTasks) ? data.customTasks.length : 0;
+
+        return (lvl * 10000) + (totalStats * 100) + (coins * 2) + exp +
+               (logLen * 2000) + (invLen * 500) + (stage * 300) + (kills * 5) + (customTasksLen * 50);
+      }
+
       function loadGameState() {
         try {
-          // 1. Check if saved data exists in primary or legacy keys
-          let raw = localStorage.getItem(SAVE_STORAGE_KEY);
-          if (!raw) {
-            for (const legKey of LEGACY_STORAGE_KEYS) {
-              const legacyData = localStorage.getItem(legKey);
-              if (legacyData) {
-                raw = legacyData;
-                try { localStorage.setItem(SAVE_STORAGE_KEY, legacyData); } catch(e) {}
-                break;
+          // 1. Gather and parse all candidate saves from localStorage
+          const candidates = [];
+          for (const key of ALL_CANDIDATE_KEYS) {
+            try {
+              const raw = localStorage.getItem(key);
+              if (raw && raw.trim().length > 10) {
+                const parsed = JSON.parse(raw);
+                if (parsed && typeof parsed === 'object') {
+                  candidates.push({ key, data: parsed, score: evaluateSaveCandidateScore(parsed) });
+                }
               }
+            } catch(e) {
+              console.warn(`[Load] Failed to parse candidate key: ${key}`, e);
             }
           }
 
-          // 2. If NO save data exists (初回アクセス時のみ初期データを作成)
-          if (!raw) {
+          // 2. If NO save data exists in any key (初回アクセス時のみ初期データを作成)
+          if (candidates.length === 0) {
             const initialState = JSON.parse(JSON.stringify(DEFAULT_STATE));
             initialState.lastActiveTimestamp = Date.now();
             initialState.lastSavedAt = Date.now();
             try {
-              localStorage.setItem(SAVE_STORAGE_KEY, JSON.stringify(initialState));
-              localStorage.setItem('questlife_rpg_save_v4', JSON.stringify(initialState));
+              const serialized = JSON.stringify(initialState);
+              localStorage.setItem(SAVE_STORAGE_KEY, serialized);
+              localStorage.setItem('questlife_rpg_save_v4', serialized);
+              localStorage.setItem(BACKUP_STORAGE_KEY, serialized);
               localStorage.setItem(DC_LAST_TIMESTAMP_KEY, Date.now().toString());
             } catch(e) {}
             return initialState;
           }
 
-          // 3. If save data exists (2回目以降は保存されたデータを復元)
-          const parsed = JSON.parse(raw);
+          // 3. Sort candidates to find the one with the highest player progress score
+          candidates.sort((a, b) => b.score - a.score);
+          const best = candidates[0].data;
+          const bestChar = best.character || {};
 
-          // Deep merge to guarantee all fields are preserved even when code is updated
-          const combined = {
-            character: {
-              ...DEFAULT_STATE.character,
-              ...(parsed.character || {}),
-              equipped: {
-                ...DEFAULT_STATE.character.equipped,
-                ...(parsed.character?.equipped || {})
-              }
-            },
-            inventory: Array.isArray(parsed.inventory) ? parsed.inventory : JSON.parse(JSON.stringify(DEFAULT_STATE.inventory)),
-            customTasks: Array.isArray(parsed.customTasks) && parsed.customTasks.length > 0 
-              ? parsed.customTasks 
-              : JSON.parse(JSON.stringify(DEFAULT_STATE.customTasks)),
-            achievementLogs: Array.isArray(parsed.achievementLogs) ? parsed.achievementLogs : [],
-            battle: {
-              ...DEFAULT_STATE.battle,
-              ...(parsed.battle || {})
-            },
-            activeBuffs: {
-              ...DEFAULT_STATE.activeBuffs,
-              ...(parsed.activeBuffs || {})
-            },
-            version: APP_VERSION,
-            saveFormatVersion: parsed.saveFormatVersion || APP_SAVE_FORMAT_VERSION,
-            lastActiveTimestamp: parsed.lastActiveTimestamp || Date.now(),
-            lastSavedAt: parsed.lastSavedAt || Date.now(),
-            soundEnabled: parsed.soundEnabled !== undefined ? parsed.soundEnabled : true
+          // Cross-check all candidates to guarantee that higher stats/levels from ANY key are preserved
+          let maxLevel = Math.max(1, Number(bestChar.level ?? best.level ?? 1));
+          let maxExp = Math.max(0, Number(bestChar.exp ?? best.exp ?? 0));
+          let maxStr = Math.max(10, Number(bestChar.str ?? best.str ?? DEFAULT_STATE.character.str));
+          let maxInt = Math.max(10, Number(bestChar.int ?? best.int ?? DEFAULT_STATE.character.int));
+          let maxDex = Math.max(10, Number(bestChar.dex ?? best.dex ?? DEFAULT_STATE.character.dex));
+          let maxCoins = Math.max(0, Number(bestChar.coins ?? best.coins ?? DEFAULT_STATE.character.coins));
+          let maxStage = Math.max(1, Number(best.battle?.stage ?? best.stage ?? 1));
+          let maxKills = Math.max(0, Number(best.battle?.killCount ?? best.killCount ?? 0));
+
+          candidates.forEach(cand => {
+            const d = cand.data;
+            const c = d.character || {};
+            const cLvl = Number(c.level ?? d.level);
+            if (!isNaN(cLvl) && cLvl > maxLevel) {
+              maxLevel = cLvl;
+              maxExp = Number(c.exp ?? d.exp ?? 0) || 0;
+            }
+            const cStr = Number(c.str ?? d.str);
+            if (!isNaN(cStr) && cStr > maxStr) maxStr = cStr;
+            const cInt = Number(c.int ?? d.int);
+            if (!isNaN(cInt) && cInt > maxInt) maxInt = cInt;
+            const cDex = Number(c.dex ?? d.dex);
+            if (!isNaN(cDex) && cDex > maxDex) maxDex = cDex;
+            const cCoins = Number(c.coins ?? d.coins);
+            if (!isNaN(cCoins) && cCoins > maxCoins) maxCoins = cCoins;
+            const bStage = Number(d.battle?.stage ?? d.stage);
+            if (!isNaN(bStage) && bStage > maxStage) maxStage = bStage;
+            const bKills = Number(d.battle?.killCount ?? d.killCount);
+            if (!isNaN(bKills) && bKills > maxKills) maxKills = bKills;
+          });
+
+          // Equipment slots restoration (never revert equipped to defaults if user had items)
+          const rawEquipped = bestChar.equipped || best.equipped || {};
+          const restoredEquipped = {
+            weapon: (rawEquipped.weapon !== undefined) ? rawEquipped.weapon : DEFAULT_STATE.character.equipped.weapon,
+            armor: (rawEquipped.armor !== undefined) ? rawEquipped.armor : DEFAULT_STATE.character.equipped.armor,
+            accessory: (rawEquipped.accessory !== undefined) ? rawEquipped.accessory : null
           };
 
+          // Inventory restoration: merge all unique items across all candidate saves
+          const inventoryMap = new Map();
+          candidates.forEach(cand => {
+            if (Array.isArray(cand.data.inventory)) {
+              cand.data.inventory.forEach(item => {
+                if (item && typeof item === 'object') {
+                  const itemId = item.id || `item_${item.name || 'gear'}_${item.type || 'w'}_${item.level || 1}`;
+                  if (!inventoryMap.has(itemId)) {
+                    // Deep copy item and normalize properties
+                    const clonedItem = JSON.parse(JSON.stringify(item));
+                    if (!clonedItem.id) clonedItem.id = itemId;
+                    if (!clonedItem.level) clonedItem.level = clonedItem.stageFound || 1;
+                    if (clonedItem.bonusPercent === undefined) clonedItem.bonusPercent = 5;
+                    inventoryMap.set(itemId, clonedItem);
+                  }
+                }
+              });
+            }
+          });
+
+          let mergedInventory = Array.from(inventoryMap.values());
+          if (mergedInventory.length === 0) {
+            mergedInventory = JSON.parse(JSON.stringify(DEFAULT_STATE.inventory));
+          }
+
           // Guard: ensure starting armor exists if inventory was somehow missing armor
-          if (!combined.inventory.some(i => i.type === 'armor')) {
-            combined.inventory.push(JSON.parse(JSON.stringify(DEFAULT_STATE.inventory[1])));
-            if (!combined.character.equipped.armor) {
-              combined.character.equipped.armor = 'starter_leather';
+          if (!mergedInventory.some(i => i.type === 'armor')) {
+            mergedInventory.push(JSON.parse(JSON.stringify(DEFAULT_STATE.inventory[1])));
+            if (!restoredEquipped.armor) {
+              restoredEquipped.armor = 'starter_leather';
             }
           }
 
-          // Guard: ensure all inventory items have valid level and properties
-          if (Array.isArray(combined.inventory)) {
-            combined.inventory.forEach(item => {
-              if (!item.level) item.level = item.stageFound || 1;
-              if (item.bonusPercent === undefined) item.bonusPercent = 5;
-            });
+          // Achievement Logs: merge and deduplicate across all candidates so no history is lost
+          const logsMap = new Map();
+          candidates.forEach(cand => {
+            if (Array.isArray(cand.data.achievementLogs)) {
+              cand.data.achievementLogs.forEach(log => {
+                if (log && typeof log === 'object' && log.timestamp) {
+                  const key = log.id || `${log.timestamp}_${log.taskName || log.taskId || ''}_${log.hours || ''}`;
+                  if (!logsMap.has(key)) {
+                    logsMap.set(key, JSON.parse(JSON.stringify(log)));
+                  }
+                }
+              });
+            }
+          });
+
+          // Sort logs chronologically (newest first for state.achievementLogs)
+          const mergedLogs = Array.from(logsMap.values()).sort((a, b) => {
+            const dateA = parseLogDate(a.timestamp)?.getTime() || 0;
+            const dateB = parseLogDate(b.timestamp)?.getTime() || 0;
+            return dateB - dateA;
+          });
+
+          // Custom Tasks: preserve user created tasks, combined with default task templates
+          const taskMap = new Map();
+          DEFAULT_STATE.customTasks.forEach(t => taskMap.set(t.id, JSON.parse(JSON.stringify(t))));
+          candidates.forEach(cand => {
+            if (Array.isArray(cand.data.customTasks)) {
+              cand.data.customTasks.forEach(task => {
+                if (task && task.id) {
+                  taskMap.set(task.id, JSON.parse(JSON.stringify(task)));
+                }
+              });
+            }
+          });
+          const mergedCustomTasks = Array.from(taskMap.values());
+
+          // Battle state reconstruction with safe HP curve
+          const bestBattle = best.battle || {};
+          const stageProgress = Math.max(0, Math.min(4, Number(bestBattle.stageProgress ?? 0)));
+          const stageNum = maxStage;
+          const dbIdx = (stageNum - 1) % ENEMY_DATABASE.length;
+          const template = ENEMY_DATABASE[dbIdx] || ENEMY_DATABASE[0];
+          const isBoss = (stageProgress >= 4);
+          const bossMultiplier = isBoss ? 2.5 : 1.0;
+          const expectedMaxHp = Math.floor(template.baseHp * Math.pow(1.12, stageNum - 1) * bossMultiplier);
+
+          let enemyCurrentHp = Number(bestBattle.enemyCurrentHp);
+          let enemyMaxHp = Number(bestBattle.enemyMaxHp);
+          if (isNaN(enemyMaxHp) || enemyMaxHp <= 0 || enemyMaxHp > expectedMaxHp * 1.5) {
+            enemyMaxHp = expectedMaxHp;
           }
+          if (isNaN(enemyCurrentHp) || enemyCurrentHp <= 0 || enemyCurrentHp > enemyMaxHp) {
+            enemyCurrentHp = enemyMaxHp;
+          }
+
+          // Active buffs
+          const now = Date.now();
+          const rawBuffs = best.activeBuffs || {};
+          const restoredBuffs = {
+            speedUntil: (rawBuffs.speedUntil && rawBuffs.speedUntil > now) ? rawBuffs.speedUntil : 0,
+            dropUntil: (rawBuffs.dropUntil && rawBuffs.dropUntil > now) ? rawBuffs.dropUntil : 0,
+            coinUntil: (rawBuffs.coinUntil && rawBuffs.coinUntil > now) ? rawBuffs.coinUntil : 0,
+            critUntil: (rawBuffs.critUntil && rawBuffs.critUntil > now) ? rawBuffs.critUntil : 0,
+            nextTaskExpCharges: Math.max(0, Number(rawBuffs.nextTaskExpCharges || 0))
+          };
+
+          // Full restored state object
+          const combined = {
+            character: {
+              name: bestChar.name || best.name || DEFAULT_STATE.character.name,
+              level: maxLevel,
+              exp: maxExp,
+              str: maxStr,
+              int: maxInt,
+              dex: maxDex,
+              coins: maxCoins,
+              equipped: restoredEquipped
+            },
+            inventory: mergedInventory,
+            customTasks: mergedCustomTasks,
+            achievementLogs: mergedLogs,
+            battle: {
+              killCount: maxKills,
+              stage: stageNum,
+              stageProgress: stageProgress,
+              enemyCurrentHp: enemyCurrentHp,
+              enemyMaxHp: enemyMaxHp
+            },
+            activeBuffs: restoredBuffs,
+            version: APP_VERSION,
+            saveFormatVersion: APP_SAVE_FORMAT_VERSION,
+            lastActiveTimestamp: best.lastActiveTimestamp || now,
+            lastSavedAt: best.lastSavedAt || now,
+            soundEnabled: best.soundEnabled !== undefined ? best.soundEnabled : true
+          };
 
           // Timestamp sync
           const savedTimestampStr = localStorage.getItem(DC_LAST_TIMESTAMP_KEY) || localStorage.getItem(DC_LAST_ACTIVE_KEY);
@@ -1777,25 +1963,17 @@
             combined.lastActiveTimestamp = savedTime;
           }
 
-          // 旧セーブデータに巨大な旧killMultiplierの敵HPが残っていた場合の安全適正化（詰み防止）
-          if (combined.battle) {
-            const stageNum = Math.max(1, combined.battle.stage || 1);
-            const dbIdx = (stageNum - 1) % ENEMY_DATABASE.length;
-            const template = ENEMY_DATABASE[dbIdx] || ENEMY_DATABASE[0];
-            const isBoss = (combined.battle.stageProgress >= 4);
-            const bossMultiplier = isBoss ? 2.5 : 1.0;
-            const expectedMaxHp = Math.floor(template.baseHp * Math.pow(1.12, stageNum - 1) * bossMultiplier);
-            if (combined.battle.enemyMaxHp > expectedMaxHp * 1.5) {
-              combined.battle.enemyMaxHp = expectedMaxHp;
-              if (combined.battle.enemyCurrentHp > expectedMaxHp) {
-                combined.battle.enemyCurrentHp = expectedMaxHp;
-              }
-            }
-          }
+          // Synchronize cleanly to primary and legacy keys immediately so all keys are up to date
+          try {
+            const serialized = JSON.stringify(combined);
+            localStorage.setItem(SAVE_STORAGE_KEY, serialized);
+            localStorage.setItem('questlife_rpg_save_v4', serialized);
+            localStorage.setItem(BACKUP_STORAGE_KEY, serialized);
+          } catch(e) {}
 
           return combined;
         } catch(e) {
-          console.error("loadGameState error, falling back to default state:", e);
+          console.error("[Load] loadGameState critical error, falling back to default state:", e);
           return JSON.parse(JSON.stringify(DEFAULT_STATE));
         }
       }
@@ -1826,6 +2004,31 @@
       }
 
       function saveGameState(isSilent = true) {
+        // Guard 1: Block saves before initial app boot and state restoration is fully complete
+        if (!isGameReadyToSave) {
+          return;
+        }
+
+        // Guard 2: Prevent saving uninitialized/reset state over an existing progressed save in localStorage
+        try {
+          const existingRaw = localStorage.getItem(SAVE_STORAGE_KEY) || localStorage.getItem('questlife_rpg_save_v4');
+          if (existingRaw) {
+            const existing = JSON.parse(existingRaw);
+            const existingLvl = Number(existing.character?.level ?? existing.level ?? 1);
+            const currentLvl = Number(state.character?.level ?? 1);
+            const existingLogsCount = Array.isArray(existing.achievementLogs) ? existing.achievementLogs.length : 0;
+            const currentLogsCount = Array.isArray(state.achievementLogs) ? state.achievementLogs.length : 0;
+            if (existingLvl > currentLvl && currentLvl === 1) {
+              console.error("[Save] Safeguard: Aborted saving level 1 state over existing level " + existingLvl + " save.");
+              return;
+            }
+            if (existingLogsCount > 3 && currentLogsCount === 0) {
+              console.error("[Save] Safeguard: Aborted saving 0 logs over existing " + existingLogsCount + " logs.");
+              return;
+            }
+          }
+        } catch(e) {}
+
         try {
           recordActiveTimestamp();
           state.lastSavedAt = Date.now();
@@ -1834,6 +2037,7 @@
           const serialized = JSON.stringify(state);
           localStorage.setItem(SAVE_STORAGE_KEY, serialized);
           localStorage.setItem('questlife_rpg_save_v4', serialized);
+          localStorage.setItem(BACKUP_STORAGE_KEY, serialized);
 
           // Update UI label if present
           const timeText = document.getElementById('last-saved-time-text');
@@ -3656,15 +3860,16 @@
         let monthlyExp = 0;
 
         (state.achievementLogs || []).forEach(log => {
-          if (!log.timestamp) return;
-          const logDate = new Date(log.timestamp);
+          if (!log || !log.timestamp) return;
+          const logDate = parseLogDate(log.timestamp);
+          if (!logDate) return;
           const dateKey = `${logDate.getFullYear()}-${String(logDate.getMonth()+1).padStart(2,'0')}-${String(logDate.getDate()).padStart(2,'0')}`;
           if (!logsByDate[dateKey]) logsByDate[dateKey] = [];
           logsByDate[dateKey].push(log);
 
           if (logDate.getFullYear() === currentCalendarYear && logDate.getMonth() === currentCalendarMonth) {
-            monthlyHours += (log.hours || 0);
-            monthlyExp += (log.exp || 0);
+            monthlyHours += (Number(log.hours) || 0);
+            monthlyExp += (Number(log.exp) || 0);
           }
         });
 
@@ -3731,8 +3936,9 @@
         if (titleText) titleText.innerText = `${parts[0]}年${parts[1]}月${parts[2]}日の記録`;
 
         const dayLogs = (state.achievementLogs || []).filter(log => {
-          if (!log.timestamp) return false;
-          const logDate = new Date(log.timestamp);
+          if (!log || !log.timestamp) return false;
+          const logDate = parseLogDate(log.timestamp);
+          if (!logDate) return false;
           const key = `${logDate.getFullYear()}-${String(logDate.getMonth()+1).padStart(2,'0')}-${String(logDate.getDate()).padStart(2,'0')}`;
           return key === selectedCalendarDateString;
         });
@@ -4393,12 +4599,19 @@
         openConfirmDialog('セーブデータ初期化', '本当にすべてのセーブデータをリセットしますか？\n所持装備・レベル・努力記録がすべて初期化されます。\nこの操作は取り消せません。', () => {
           try {
             localStorage.removeItem(SAVE_STORAGE_KEY);
+            localStorage.removeItem(BACKUP_STORAGE_KEY);
             LEGACY_STORAGE_KEYS.forEach(k => localStorage.removeItem(k));
             localStorage.removeItem(DC_LAST_TIMESTAMP_KEY);
             localStorage.removeItem(DC_LAST_ACTIVE_KEY);
           } catch(e) {}
+          isGameReadyToSave = true;
           state = JSON.parse(JSON.stringify(DEFAULT_STATE));
-          saveGameState(true);
+          try {
+            const serialized = JSON.stringify(state);
+            localStorage.setItem(SAVE_STORAGE_KEY, serialized);
+            localStorage.setItem('questlife_rpg_save_v4', serialized);
+            localStorage.setItem(BACKUP_STORAGE_KEY, serialized);
+          } catch(e) {}
           location.reload();
         }, true);
       }
@@ -4534,6 +4747,10 @@
         }
 
         renderAllUI();
+
+        // Mark game as completely ready to save safely
+        isGameReadyToSave = true;
+        saveGameState(true);
 
         const soundBox = document.getElementById('sound-icon-box');
         if (soundBox) {
