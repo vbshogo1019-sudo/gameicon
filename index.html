@@ -624,9 +624,35 @@
                 <div class="w-3.5 h-3.5 text-slate-400" id="settings-header-icon"></div>
                 <span>セーブ・データ管理 & サウンド</span>
               </h3>
-              <span id="save-status-indicator" class="text-[9px] text-emerald-400 bg-emerald-950/80 border border-emerald-700/60 px-1.5 py-0.5 rounded font-mono">
-                オートセーブ稼働中
-              </span>
+              <div class="flex items-center gap-1.5">
+                <span id="version-header-badge" class="text-[9px] text-amber-300 bg-amber-950/80 border border-amber-600/60 px-1.5 py-0.5 rounded font-mono font-bold">
+                  v1.2.0
+                </span>
+                <span id="save-status-indicator" class="text-[9px] text-emerald-400 bg-emerald-950/80 border border-emerald-700/60 px-1.5 py-0.5 rounded font-mono">
+                  オートセーブ稼働中
+                </span>
+              </div>
+            </div>
+
+            <!-- Version Info & Update Tracking Area -->
+            <div class="bg-slate-900/60 border border-slate-800/80 p-2 rounded-md flex items-center justify-between">
+              <div class="flex flex-col">
+                <div class="flex items-center gap-1.5">
+                  <span class="text-[10px] text-slate-400">アプリVer:</span>
+                  <strong id="card-app-version-val" class="text-[11px] text-yellow-300 font-mono font-bold">1.2.0</strong>
+                  <span class="text-[9px] text-indigo-300 bg-indigo-950/90 border border-indigo-700/60 px-1 rounded font-mono" id="card-save-format-val">SaveFormat: v5</span>
+                </div>
+                <div class="text-[9px] text-slate-400 mt-0.5" id="card-update-status-text">
+                  最新パッチ適用済 / セーブ互換性維持
+                </div>
+              </div>
+              <div class="flex flex-col items-end">
+                <span class="text-[9px] text-slate-400 font-mono" id="card-build-date-text">Build 2026.11</span>
+                <span class="text-[8px] text-emerald-400 font-mono flex items-center gap-1">
+                  <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                  正常同期中
+                </span>
+              </div>
             </div>
 
             <div class="flex items-center justify-between py-1 text-slate-300 border-b border-slate-800">
@@ -1610,6 +1636,8 @@
           critUntil: 0,
           nextTaskExpCharges: 0
         },
+        version: '1.2.0',
+        saveFormatVersion: 5,
         lastActiveTimestamp: Date.now(),
         soundEnabled: true
       };
@@ -1635,8 +1663,11 @@
       }
 
       /* ==============================================================
-       * 4. STATE STORAGE & SAVE/LOAD SYSTEM
+       * 4. STATE STORAGE & VERSION MANAGEMENT SYSTEM
        * ============================================================== */
+      const APP_VERSION = '1.2.0';
+      const APP_SAVE_FORMAT_VERSION = 5;
+      const APP_BUILD_DATE = '2026.11.05';
       const SAVE_STORAGE_KEY = 'daily_challenger_save_data';
       const LEGACY_STORAGE_KEYS = ['questlife_rpg_save_v4', 'questlife_rpg_save_v3', 'questlife_rpg_save'];
       const DC_LAST_TIMESTAMP_KEY = 'dc_last_timestamp';
@@ -1716,6 +1747,8 @@
               ...DEFAULT_STATE.activeBuffs,
               ...(parsed.activeBuffs || {})
             },
+            version: APP_VERSION,
+            saveFormatVersion: parsed.saveFormatVersion || APP_SAVE_FORMAT_VERSION,
             lastActiveTimestamp: parsed.lastActiveTimestamp || Date.now(),
             lastSavedAt: parsed.lastSavedAt || Date.now(),
             soundEnabled: parsed.soundEnabled !== undefined ? parsed.soundEnabled : true
@@ -1744,6 +1777,22 @@
             combined.lastActiveTimestamp = savedTime;
           }
 
+          // 旧セーブデータに巨大な旧killMultiplierの敵HPが残っていた場合の安全適正化（詰み防止）
+          if (combined.battle) {
+            const stageNum = Math.max(1, combined.battle.stage || 1);
+            const dbIdx = (stageNum - 1) % ENEMY_DATABASE.length;
+            const template = ENEMY_DATABASE[dbIdx] || ENEMY_DATABASE[0];
+            const isBoss = (combined.battle.stageProgress >= 4);
+            const bossMultiplier = isBoss ? 2.5 : 1.0;
+            const expectedMaxHp = Math.floor(template.baseHp * Math.pow(1.12, stageNum - 1) * bossMultiplier);
+            if (combined.battle.enemyMaxHp > expectedMaxHp * 1.5) {
+              combined.battle.enemyMaxHp = expectedMaxHp;
+              if (combined.battle.enemyCurrentHp > expectedMaxHp) {
+                combined.battle.enemyCurrentHp = expectedMaxHp;
+              }
+            }
+          }
+
           return combined;
         } catch(e) {
           console.error("loadGameState error, falling back to default state:", e);
@@ -1751,12 +1800,37 @@
         }
       }
 
+      function loadGameData() {
+        return loadGameState();
+      }
+      window.loadGameState = loadGameState;
+      window.loadGameData = loadGameData;
+
       let state = loadGameState();
+
+      function renderVersionInfo() {
+        try {
+          const appVerVal = document.getElementById('card-app-version-val');
+          const headerBadge = document.getElementById('version-header-badge');
+          const saveFormatVal = document.getElementById('card-save-format-val');
+          const buildDateText = document.getElementById('card-build-date-text');
+
+          const curVer = state.version || APP_VERSION;
+          const curSaveFmt = state.saveFormatVersion || APP_SAVE_FORMAT_VERSION;
+
+          if (appVerVal) appVerVal.innerText = curVer;
+          if (headerBadge) headerBadge.innerText = `v${curVer}`;
+          if (saveFormatVal) saveFormatVal.innerText = `SaveFormat: v${curSaveFmt}`;
+          if (buildDateText) buildDateText.innerText = `Build ${APP_BUILD_DATE}`;
+        } catch(e) {}
+      }
 
       function saveGameState(isSilent = true) {
         try {
           recordActiveTimestamp();
           state.lastSavedAt = Date.now();
+          state.version = APP_VERSION;
+          state.saveFormatVersion = APP_SAVE_FORMAT_VERSION;
           const serialized = JSON.stringify(state);
           localStorage.setItem(SAVE_STORAGE_KEY, serialized);
           localStorage.setItem('questlife_rpg_save_v4', serialized);
@@ -1768,6 +1842,7 @@
             const timeStr = `${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}:${d.getSeconds().toString().padStart(2,'0')}`;
             timeText.innerText = `最終保存: ${timeStr} (自動同期)`;
           }
+          renderVersionInfo();
 
           if (!isSilent) {
             showToast('ゲームデータをセーブしました！');
@@ -2058,13 +2133,12 @@
         const stageNum = Math.max(1, state.battle.stage || 1);
         const dbIdx = (stageNum - 1) % ENEMY_DATABASE.length;
         const template = ENEMY_DATABASE[dbIdx] || ENEMY_DATABASE[0];
-        const stageMultiplier = Math.pow(1.18, stageNum - 1);
-        const killMultiplier = 1 + ((state.battle.killCount || 0) * 0.02);
+        const stageMultiplier = Math.pow(1.12, stageNum - 1);
         
         const isBoss = (state.battle.stageProgress >= 4);
         const bossMultiplier = isBoss ? 2.5 : 1.0;
 
-        const maxHp = Math.floor(template.baseHp * stageMultiplier * killMultiplier * bossMultiplier);
+        const maxHp = Math.floor(template.baseHp * stageMultiplier * bossMultiplier);
         // コイン入手量を現在の1/5に調整
         const baseCoins = Math.max(1, Math.floor((template.baseCoins * stageMultiplier * bossMultiplier) / 5));
 
@@ -2201,6 +2275,9 @@
 
       function handleEnemyDefeated(enemy) {
         try {
+          const isBoss = Boolean((enemy && enemy.isBoss) || state.battle.stageProgress >= 4);
+          const currentBattleStage = state.battle.stage;
+
           state.battle.killCount += 1;
           state.battle.stageProgress += 1;
 
@@ -2239,13 +2316,21 @@
             dropChance = 0.40;
           }
 
-          if (Math.random() < dropChance) {
+          // ボス撃破時は確定100%ドロップ（救済天井）、通常敵は確率抽選
+          const shouldDropItem = isBoss || (Math.random() < dropChance);
+
+          if (shouldDropItem) {
             try {
-              const droppedEquip = generateDroppedEquipment(state.battle.stage);
+              const droppedEquip = generateDroppedEquipment(currentBattleStage);
               state.inventory.push(droppedEquip);
-              dropMsg = `装備GET! 「${droppedEquip.name}」(+${earnedCoins}G)`;
+              if (isBoss) {
+                dropMsg = `★BOSS確定GET! 「${droppedEquip.name}」(+${earnedCoins}G)`;
+                showToast(`★ボス撃破！確定装備GET: ${droppedEquip.name}`);
+              } else {
+                dropMsg = `装備GET! 「${droppedEquip.name}」(+${earnedCoins}G)`;
+                showToast(`装備獲得: ${droppedEquip.name}`);
+              }
               try { AudioEngine.playItemDropFanfare(); } catch(e) {}
-              showToast(`装備獲得: ${droppedEquip.name}`);
               renderInventoryList();
               if (currentPickerSlot) renderPickerItems();
             } catch(dropErr) {
@@ -4153,6 +4238,7 @@
         renderBattleUI();
         renderShopUI();
         renderCalendarView();
+        renderVersionInfo();
       }
 
       function switchTab(tabId) {
@@ -4384,11 +4470,12 @@
             }
             offlineCoins += earnedCoin;
 
+            const isBossKill = Boolean(curEnemy.isBoss || state.battle.stageProgress >= 5);
             let dropRate = 0.20;
             if (state.activeBuffs.dropUntil > (lastActive + (offlineKills * 2000))) {
               dropRate = 0.40;
             }
-            if (Math.random() < dropRate) {
+            if (isBossKill || Math.random() < dropRate) {
               const item = generateDroppedEquipment(state.battle.stage);
               state.inventory.push(item);
             }
